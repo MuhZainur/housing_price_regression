@@ -1,36 +1,39 @@
 # Nama workflow
-name: Deploy FastAPI to Google Cloud Run
+name: Deploy Production Model from MLflow to Cloud Run
 
-# Pemicu: dijalankan setiap kali ada push ke branch 'main'
+# Pemicu: Dijalankan saat ada sinyal/webhook eksternal dari MLflow
+# Kita bisa memicunya nanti dengan nama event 'model-promoted'
 on:
-  push:
-    branches:
-      - main
+  repository_dispatch:
+    types: [model_promoted_to_production]
 
-# Variabel lingkungan untuk seluruh workflow
+# Variabel lingkungan untuk seluruh workflow agar mudah diubah
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: asia-southeast2  # Contoh: asia-southeast2 (Jakarta)
-  GAR_REPOSITORY: housing_price_regression # Contoh: housing-price-repo (Nama repo di Artifact Registry)
-  SERVICE_NAME: housing-price-api # Nama layanan di Cloud Run
+  GCP_REGION: asia-southeast2 # Ganti dengan region Anda, misal: asia-southeast2 (Jakarta)
+  GAR_REPOSITORY: housing-price-repo # Ganti dengan nama repo Anda di Artifact Registry
+  SERVICE_NAME: housing-price-api # Nama layanan Anda di Cloud Run
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }} # URI server MLflow dari secrets
+  MODEL_NAME: properti-regressor-pycaret # Nama model Anda di MLflow Model Registry
 
 jobs:
   build-and-deploy:
     # Jalankan di server Ubuntu terbaru dari GitHub
     runs-on: ubuntu-latest
 
-    # Izin yang dibutuhkan oleh job
+    # Izin yang dibutuhkan oleh job untuk otentikasi ke GCP
     permissions:
       contents: 'read'
       id-token: 'write'
 
     steps:
-    # Langkah 1: Checkout kode dari repository GitHub
-    - name: Checkout code
+    # Langkah 1: Checkout kode aplikasi (FastAPI, Dockerfile, dll.) dari GitHub
+    - name: Checkout Application Code
       uses: actions/checkout@v3
 
-    # Langkah 2: Otentikasi ke Google Cloud
+    # Langkah 2: Otentikasi ke Google Cloud menggunakan Service Account
     - name: Authenticate to Google Cloud
+      id: auth
       uses: 'google-github-actions/auth@v2'
       with:
         credentials_json: '${{ secrets.GCP_SA_KEY }}'
@@ -39,29 +42,54 @@ jobs:
     - name: Set up Cloud SDK
       uses: 'google-github-actions/setup-gcloud@v2'
 
-    # Langkah 4: Konfigurasi Docker untuk bisa push ke Artifact Registry
-    - name: Configure Docker
-      run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+    # Langkah 4: Setup Python untuk bisa menjalankan skrip MLflow
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-    # Langkah 5: Bangun (build) Docker image dari Dockerfile Anda
+    # Langkah 5: Install MLflow client untuk mengunduh model
+    - name: Install MLflow Client
+      run: pip install mlflow
+
+    # Langkah 6: Unduh "Production" model terbaru dari MLflow Registry
+    # Model akan diunduh ke dalam sebuah folder bernama 'model'
+    - name: Download Production Model from MLflow
+      run: |
+        mlflow artifacts download \
+          --artifact-uri "models:/${{ env.MODEL_NAME }}/Production" \
+          --dst-path .
+      # Perintah di atas akan mengunduh artifact ke dalam subdirektori
+      # Kita perlu tahu nama subdirektori itu, biasanya sama dengan nama model
+      # Mari kita asumsikan untuk sekarang modelnya ada di dalam folder ./model
+
+    # Langkah 7: Konfigurasi Docker untuk bisa push ke Artifact Registry
+    - name: Configure Docker
+      run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+    # Langkah 8: Bangun (build) Docker image dari Dockerfile Anda
+    # Dockerfile Anda harus diatur untuk menyalin folder 'model' yang baru diunduh
     - name: Build Docker image
-      run: |-
+      run: |
         docker build \
-          --tag "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" \
+          --tag "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" \
           .
 
-    # Langkah 6: Dorong (push) Docker image ke Google Artifact Registry
+    # Langkah 9: Dorong (push) Docker image ke Google Artifact Registry
     - name: Push Docker image to Artifact Registry
-      run: |-
-        docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+      run: |
+        docker push "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
 
-    # Langkah 7: Deploy image baru ke Google Cloud Run
+    # Langkah 10: Deploy image baru ke Google Cloud Run
     - name: Deploy to Cloud Run
+      id: deploy
       uses: 'google-github-actions/deploy-cloudrun@v2'
       with:
         service: ${{ env.SERVICE_NAME }}
-        region: ${{ env.REGION }}
-        # Gunakan image yang baru saja kita push
-        image: "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
-        # Izinkan akses publik ke API kita
-        flags: '--allow-unauthenticated'
+        region: ${{ env.GCP_REGION }}
+        image: "${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+        flags: '--allow-unauthenticated' # Izinkan akses publik ke API kita
+
+    # Langkah 11: Tampilkan URL dari API yang sudah di-deploy
+    - name: Show Deployed URL
+      run: echo "Service deployed to ${{ steps.deploy.outputs.url }}"
