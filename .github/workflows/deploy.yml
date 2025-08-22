@@ -1,0 +1,67 @@
+# Nama workflow
+name: Deploy FastAPI to Google Cloud Run
+
+# Pemicu: dijalankan setiap kali ada push ke branch 'main'
+on:
+  push:
+    branches:
+      - main
+
+# Variabel lingkungan untuk seluruh workflow
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: asia-southeast2  # Contoh: asia-southeast2 (Jakarta)
+  GAR_REPOSITORY: housing_price_regression # Contoh: housing-price-repo (Nama repo di Artifact Registry)
+  SERVICE_NAME: housing-price-api # Nama layanan di Cloud Run
+
+jobs:
+  build-and-deploy:
+    # Jalankan di server Ubuntu terbaru dari GitHub
+    runs-on: ubuntu-latest
+
+    # Izin yang dibutuhkan oleh job
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+    # Langkah 1: Checkout kode dari repository GitHub
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # Langkah 2: Otentikasi ke Google Cloud
+    - name: Authenticate to Google Cloud
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    # Langkah 3: Setup gcloud CLI (alat bantu Google Cloud)
+    - name: Set up Cloud SDK
+      uses: 'google-github-actions/setup-gcloud@v2'
+
+    # Langkah 4: Konfigurasi Docker untuk bisa push ke Artifact Registry
+    - name: Configure Docker
+      run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+    # Langkah 5: Bangun (build) Docker image dari Dockerfile Anda
+    - name: Build Docker image
+      run: |-
+        docker build \
+          --tag "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" \
+          .
+
+    # Langkah 6: Dorong (push) Docker image ke Google Artifact Registry
+    - name: Push Docker image to Artifact Registry
+      run: |-
+        docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+
+    # Langkah 7: Deploy image baru ke Google Cloud Run
+    - name: Deploy to Cloud Run
+      uses: 'google-github-actions/deploy-cloudrun@v2'
+      with:
+        service: ${{ env.SERVICE_NAME }}
+        region: ${{ env.REGION }}
+        # Gunakan image yang baru saja kita push
+        image: "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+        # Izinkan akses publik ke API kita
+        flags: '--allow-unauthenticated'
